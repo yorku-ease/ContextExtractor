@@ -1,0 +1,15 @@
+{
+  "rows_seen": 150000,
+  "accepted": 111172,
+  "two_message": 52840,
+  "single_added": 52330,
+  "multi_turn": 45508,
+  "multi_turn_no_clarification": 44691,
+  "duplicate_in_current_run": 12824,
+  "failed_safety": 2731,
+  "short_prompt": 33162,
+  "two_message_clarification": 510,
+  "clarification_detected": 817,
+  "interactive_added": 584,
+  "failed_alternation": 2935
+}
