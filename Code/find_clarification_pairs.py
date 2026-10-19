@@ -37,28 +37,59 @@ def get_adapter(source):
             f"No adapter defined for {source}"
         )
 
-logging.basicConfig(
-    filename="Data/diagnostics.log",
-    level=logging.INFO,
-    format="%(asctime)s %(message)s"
+DIRECT_CLARIFICATION = re.compile(
+    r"(?i)\b(?:"
+    r"could you (?:please )?(?:provide|share|specify|clarify|"
+    r"explain|elaborate|rephrase|complete|tell me)|"
+    r"can you (?:please )?(?:provide|share|specify|clarify|"
+    r"explain|elaborate|rephrase|complete|tell me)|"
+    r"would you (?:please )?(?:provide|share|specify|clarify|"
+    r"explain|elaborate|rephrase|complete|tell me)|"
+    r"please (?:provide|share|specify|clarify|elaborate|"
+    r"rephrase|complete|send|paste|upload)|"
+    r"what do you mean(?: by)?|"
+    r"do you mean|"
+    r"which (?:one|version|language|framework|platform|"
+    r"operating system|country|jurisdiction|format)|"
+    r"what (?:version|language|framework|platform|"
+    r"operating system|country|jurisdiction|format)|"
+    r"are you referring to|"
+    r"could you be more specific|"
+    r"can you be more specific"
+    r")\b"
 )
 
-QUESTION_WORDS = re.compile(
-    r"(?i)\b(?:what|which|who|whom|whose|when|where|why|how|could you|"
-    r"can you|would you|do you|are you|is it|please provide|please specify|"
-    r"please clarify|can you clarify|could you clarify|tell me more)\b"
+MISSING_INFORMATION = re.compile(
+    r"(?i)\b(?:"
+    r"i need (?:more|additional|some) "
+    r"(?:information|details|context)|"
+    r"more information is needed|"
+    r"more details are needed|"
+    r"additional information is needed|"
+    r"additional context is needed|"
+    r"without (?:more|additional) "
+    r"(?:information|details|context)|"
+    r"not enough (?:information|details|context)|"
+    r"the question is incomplete|"
+    r"your question is incomplete|"
+    r"it is not clear what you mean|"
+    r"i(?:'m| am) not sure what you mean|"
+    r"i(?:'m| am) not sure what you(?:'re| are) asking"
+    r")\b"
 )
-INFO_REQUESTS = re.compile(
-    r"(?i)\b(?:if you (?:can |could |would )?(?:provide|share|tell)|"
-    r"if you provide me with|to (?:better )?(?:help|answer|assist)|"
-    r"need (?:more|additional|some) (?:information|details|context)|"
-    r"more information|additional details|further context|"
-    r"it would help (?:to know|if)|depends on|could you elaborate|"
-    r"what do you mean|do you mean)\b"
-)
-GENERIC_OFFER = re.compile(
-    r"(?i)^(?:let me know if you have any questions|"
-    r"is there anything else i can help you with)[.!? ]*$"
+
+GENERIC_CLOSING = re.compile(
+    r"(?i)(?:"
+    r"how can i (?:help|assist) you(?: today)?|"
+    r"how may i (?:help|assist) you(?: today)?|"
+    r"what can i (?:help|assist) you with(?: today)?|"
+    r"is there anything else i can (?:help|assist) you with|"
+    r"what else can i (?:help|assist) you with|"
+    r"do you have any (?:other|further) questions|"
+    r"let me know if you have any (?:other|further)? ?questions|"
+    r"please let me know if you have any (?:other|further)? ?questions|"
+    r"feel free to ask(?: me)?(?: any questions)?"
+    r")[.!? ]*$"
 )
 
 DOMAIN_PATTERNS: Dict[str, re.Pattern] = {
@@ -70,6 +101,13 @@ DOMAIN_PATTERNS: Dict[str, re.Pattern] = {
     "finance": re.compile(r"(?i)\b(?:investment|portfolio|tax|mortgage|budget|finance|stock|interest rate|loan)\b"),
     "travel": re.compile(r"(?i)\b(?:travel|trip|hotel|flight|itinerary|visa|destination|airport)\b"),
     "writing": re.compile(r"(?i)\b(?:write|rewrite|email|essay|letter|tone|audience|proofread|paragraph)\b"),
+}
+
+SOURCE_NAMES = {
+    "allenai/WildChat": "WildChat",
+    "lmsys/lmsys-chat-1m": "LMSYS",
+    "convai-challenge/conv_ai_3": "ClariQ",
+    "sewon/ambig_qa": "AmbigQA",
 }
 
 @dataclass
@@ -179,36 +217,59 @@ def is_safe_row(
     return True
 
 
-def is_clarification(
-    response: str
-) -> bool:
-
-    text = clean_text(
-        response
-    )
+def is_clarification(response: str) -> bool:
+    text = clean_text(response)
 
     if not text:
         return False
 
-    if (
-        GENERIC_OFFER.fullmatch(
-            text
-        )
-    ):
+    # Remove generic trailing offers before evaluating the response.
+    substantive_text = GENERIC_CLOSING.sub("", text).strip()
+
+    if not substantive_text:
         return False
 
-    if not text.endswith("?"):
+    # Extremely long substantive answers are unlikely to be clarification
+    # questions, even if they contain incidental trigger phrases.
+    if len(substantive_text.split()) > 180:
         return False
 
-    return bool(
-        QUESTION_WORDS.search(
-            text
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+",
+            substantive_text,
         )
-        or
-        INFO_REQUESTS.search(
-            text
-        )
+        if sentence.strip()
+    ]
+
+    if not sentences:
+        return False
+
+    # A clarification request should appear near the end of the response.
+    tail = " ".join(sentences[-2:])
+
+    direct_request = bool(
+        DIRECT_CLARIFICATION.search(tail)
     )
+
+    missing_information = bool(
+        MISSING_INFORMATION.search(tail)
+    )
+
+    asks_question = "?" in tail
+
+    # A direct request is sufficient, even if punctuation is imperfect:
+    # "Please provide the original text."
+    if direct_request:
+        return True
+
+    # A statement of missing information must be paired with a question.
+    # This prevents full answers containing incidental phrases from passing.
+    if missing_information and asks_question:
+        return True
+
+    return False
 
 
 def infer_domain(text: str) -> str:
@@ -297,8 +358,11 @@ def collect_candidates(
     used_hashes: set[str],
     scan_limit: int,
     interactive_limit: int,
+    num_turns: int,
     single_limit: int,
     adapter,
+    stats_path: str,
+    language: str,
 ) -> Tuple[List[Candidate], List[Candidate]]:
 
     interactive: List[Candidate] = []
@@ -330,6 +394,23 @@ def collect_candidates(
         if candidate is None:
             continue
 
+        if language:
+
+            candidate_lang = (
+                candidate.language
+                .lower()
+                .strip()
+            )
+
+            accepted = {
+                language.lower(),
+                "english",
+            }
+
+            if candidate_lang not in accepted:
+                diagnostics["wrong_language"] += 1
+                continue
+
         prompt_hash = text_hash(
             candidate.initial_prompt
         )
@@ -350,40 +431,72 @@ def collect_candidates(
             candidate.first_response
         )
 
-        if len(messages) >= 4:
-            diagnostics["multi_turn"] += 1
-
-            if clarification:
-                diagnostics["clarification_detected"] += 1
-
-                user_reply = clean_text(
-                    messages[2]["content"]
-                )
-
-                if (
-                        messages[2]["role"] == "user"
-                        and len(
-                            user_reply.split()
-                        ) <= 20
-                ):
-                    interactive.append(candidate)
-                    diagnostics["interactive_added"] += 1
-            else:
-                diagnostics["multi_turn_no_clarification"] += 1
-
-        elif len(messages) == 2:
+        if len(messages) == 2:
             diagnostics["two_message"] += 1
 
-            if not clarification:
-                single.append(candidate)
-                diagnostics["single_added"] += 1
-            else:
+            if clarification:
                 diagnostics[
                     "two_message_clarification"
                 ] += 1
+                continue
 
-        else:
-            diagnostics["other_message_count"] += 1
+            single.append(candidate)
+            diagnostics["single_added"] += 1
+            continue
+
+        user_turns = sum(
+            1
+            for message in messages
+            if message["role"] == "user"
+        )
+
+        if user_turns != num_turns:
+            diagnostics["wrong_num_turns"] += 1
+            continue
+
+        diagnostics["multi_turn"] += 1
+
+        if not clarification:
+            diagnostics[
+                "multi_turn_no_clarification"
+            ] += 1
+            continue
+
+        diagnostics["clarification_detected"] += 1
+
+        user_reply = clean_text(
+            messages[2]["content"]
+        )
+
+        if messages[2]["role"] != "user":
+            diagnostics[
+                "missing_user_clarification"
+            ] += 1
+            continue
+
+        if not user_reply:
+            diagnostics[
+                "empty_user_clarification"
+            ] += 1
+            continue
+
+        if len(user_reply.split()) > 20:
+            diagnostics[
+                "long_user_clarification"
+            ] += 1
+            continue
+
+        interactive.append(candidate)
+        diagnostics["interactive_added"] += 1
+
+        if diagnostics["clarification_detected"] <= 100:
+            logging.info(
+                "CLARIFICATION | prompt=%r | "
+                "response=%r | user_reply=%r",
+                candidate.initial_prompt,
+                candidate.first_response,
+                user_reply,
+            )
 
         if (
             diagnostics["rows_seen"] % 10_000 == 0
@@ -420,7 +533,7 @@ def collect_candidates(
     json.dump(
         diagnostics,
         open(
-            "Data/candidate_stats.json",
+            stats_path,
             "w",
             encoding="utf-8"
         ),
@@ -674,23 +787,83 @@ def main(
     source: str = "allenai/WildChat",
     split: str = "train",
     n: int = 10,
-    history_file: str = "selected_prompt_history.jsonl",
-    output_file: str = "matched_examples.jsonl",
+    language: str = "en",
     matching_method: str = "tfidf",
     scan_limit: int = 150_000,
     interactive_limit: int = 1_500,
+    num_turns: int = 2,
     single_limit: int = 8_000,
     min_similarity: float = 0.16,
     domain_bonus: float = 0.04,
     hf_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return up to n new pairs and append them to persistent JSONL files."""
-    history_path = Path(history_file)
-    output_path = Path(output_file)
-    used_hashes = load_used_hashes(history_path)
+
+
 
     adapter = get_adapter(source)
 
+    source_name = SOURCE_NAMES.get(
+        source,
+        source.replace("/", "_")
+    )
+
+    run_dir = (
+            Path("Data")
+            / source_name
+            / matching_method
+            / f"length_{num_turns}"
+    )
+
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    history_path = (
+            run_dir
+            / "selected_prompt_history.jsonl"
+    )
+
+    output_path = (
+            run_dir
+            / "matched_examples.jsonl"
+    )
+
+    stats_path = (
+            run_dir
+            / "candidate_stats.json"
+    )
+
+    metadata_path = (
+            run_dir
+            / "run_metadata.json"
+    )
+
+    logging.basicConfig(
+        filename=run_dir / "diagnostics.log",
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        force=True,
+    )
+
+    logging.getLogger(
+        "httpx"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "httpcore"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "huggingface_hub"
+    ).setLevel(logging.WARNING)
+
+    logging.getLogger(
+        "datasets"
+    ).setLevel(logging.WARNING)
+
+    used_hashes = load_used_hashes(history_path)
 
     interactive, single = collect_candidates(
         source=source,
@@ -699,8 +872,11 @@ def main(
         used_hashes=used_hashes,
         scan_limit=scan_limit,
         interactive_limit=interactive_limit,
+        num_turns=num_turns,
         single_limit=single_limit,
         adapter=adapter,
+        stats_path=stats_path,
+        language=language,
     )
     print("Interactive:", len(interactive))
     print("Single-shot:", len(single))
@@ -713,6 +889,30 @@ def main(
         matching_method,
     )
     append_results(pairs, history_path, output_path, matching_method)
+
+    metadata = {
+        "source": source,
+        "source_name": source_name,
+        "matching_method": matching_method,
+        "scan_limit": scan_limit,
+        "interactive_limit": interactive_limit,
+        "num_turns": num_turns,
+        "single_limit": single_limit,
+        "min_similarity": min_similarity,
+        "domain_bonus": domain_bonus,
+        "generated_pairs": len(pairs),
+        "language": language,
+    }
+
+    with metadata_path.open(
+            "w",
+            encoding="utf-8"
+    ) as f:
+        json.dump(
+            metadata,
+            f,
+            indent=2
+        )
 
     results = [
         {
@@ -736,11 +936,11 @@ def cli() -> None:
     parser.add_argument("--source", default="allenai/WildChat")
     parser.add_argument("--split", default="train")
     parser.add_argument("--n", type=int, default=10)
-    parser.add_argument("--history-file", default="Data/selected_prompt_history.jsonl")
-    parser.add_argument("--output-file", default="Data/matched_examples.jsonl")
+    parser.add_argument("--language", default="en")
     parser.add_argument("--matching-method", choices=['tfidf', 'embeddings'], default="tfidf")
     parser.add_argument("--scan-limit", type=int, default=150_000)
     parser.add_argument("--interactive-limit", type=int, default=1_500)
+    parser.add_argument("--num_turns", type=int, choices=[2, 3, 4, 5, 6], default=2)
     parser.add_argument("--single-limit", type=int, default=8_000)
     parser.add_argument("--min-similarity", type=float, default=None)
     parser.add_argument("--domain-bonus", type=float, default=0.04)
@@ -764,11 +964,11 @@ def cli() -> None:
         source=args.source,
         split=args.split,
         n=args.n,
-        history_file=args.history_file,
-        output_file=args.output_file,
+        language=args.language,
         matching_method=args.matching_method,
         scan_limit=args.scan_limit,
         interactive_limit=args.interactive_limit,
+        num_turns=args.num_turns,
         single_limit=args.single_limit,
         min_similarity=args.min_similarity,
         domain_bonus=args.domain_bonus,
