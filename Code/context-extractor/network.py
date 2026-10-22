@@ -8,6 +8,9 @@ from langgraph.constants import START, END
 from langgraph.graph import StateGraph, MessagesState
 from langgraph.types import interrupt, Command
 
+from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 MAX_CLARIFICATIONS = 5
 
 STOP_MESSAGE = "I do not need any more information"
@@ -54,12 +57,20 @@ Rules:
 - Output only the synthesized query.
 """
 
+MAIN_MODEL_SYSTEM_PROMPT = """
+Answer the user's request accurately and directly.
+
+Use only the information given in the request.
+Do not assume facts the user has not provided.
+"""
+
 def empty_token_usage() -> TokenUsage:
     return {
         "input_tokens": 0,
         "output_tokens": 0,
-        "reasoning_tokens": 0,
+        "reasoning_tokens": None,
         "total_tokens": 0,
+        "cached_input_tokens": None,
     }
 
 class LocalModel:
@@ -78,8 +89,9 @@ class Clarification(TypedDict):
 class TokenUsage(TypedDict):
     input_tokens: int
     output_tokens: int
-    reasoning_tokens: int
+    reasoning_tokens: int | None
     total_tokens: int
+    cached_input_tokens: int | None
 
 class ClarificationState(MessagesState):
     original_query: str
@@ -88,21 +100,53 @@ class ClarificationState(MessagesState):
     extraction_complete: bool
     expanded_query: str | None
 
+    original_answer: str | None
+    expanded_answer: str | None
+
     extractor_usage: TokenUsage
     synthesis_usage: TokenUsage
+    original_answer_usage: TokenUsage
+    expanded_answer_usage: TokenUsage
 
 class ContextNetwork:
     extractor_model: LocalModel
     synthesis_model: LocalModel
     builder: StateGraph
 
-    def __init__(self, extractor_model_name: str, extractor_temperature: float=0, synthesis_model_name: str=None, synthesis_temperature: float=0):
+    def __init__(self, extractor_model_name: str, extractor_temperature: float=0, synthesis_model_name: str=None, synthesis_temperature: float=0,
+                 main_model_provider: str="openai", main_model_name: str = "gpt-6.1-sol", main_model_temperature: float=0):
 
         extractor_base_model = ChatOllama(model=extractor_model_name, temperature=extractor_temperature)
         self.extractor_model = LocalModel(extractor_base_model)
         synthesis_base_model = ChatOllama(model=synthesis_model_name, temperature=synthesis_temperature)
         self.synthesis_model = LocalModel(synthesis_base_model)
         self.builder = StateGraph(ClarificationState)
+
+        self.main_model = self.create_main_model(
+            provider=main_model_provider,
+            model_name=main_model_name,
+            temperature=main_model_temperature,
+        )
+
+    def create_main_model(self,
+            provider: Literal["openai", "gemini"],
+            model_name: str,
+            temperature: float = 0,
+    ) -> BaseChatModel:
+
+        if provider == "openai":
+            return ChatOpenAI(
+                model=model_name,
+            )
+
+        if provider == "gemini":
+            return ChatGoogleGenerativeAI(
+                model=model_name,
+            )
+
+        raise ValueError(
+            f"Unsupported provider: {provider}"
+        )
 
     def generate_question(self, state: ClarificationState):
         """
@@ -112,10 +156,6 @@ class ContextNetwork:
         extraction process as complete.
         """
         response = self.extractor_model.invoke(state["messages"])
-
-        response = self.extractor_model.invoke(
-            state["messages"]
-        )
 
         call_usage = get_token_usage(response)
         previous_usage = state["extractor_usage"]
@@ -129,13 +169,19 @@ class ContextNetwork:
                 previous_usage["output_tokens"]
                 + call_usage["output_tokens"],
 
-            "reasoning_tokens":
-                previous_usage["reasoning_tokens"]
-                + call_usage["reasoning_tokens"],
+            "reasoning_tokens": sum_optional([
+                previous_usage["reasoning_tokens"],
+                call_usage["reasoning_tokens"],
+            ]),
 
             "total_tokens":
                 previous_usage["total_tokens"]
                 + call_usage["total_tokens"],
+
+            "cached_input_tokens": sum_optional([
+                previous_usage["cached_input_tokens"],
+                call_usage["cached_input_tokens"],
+            ]),
         }
 
         content = response.content.strip()
@@ -270,10 +316,69 @@ class ContextNetwork:
             "synthesis_usage": synthesis_usage,
         }
 
+    def answer_original_query(
+            self,
+            state: ClarificationState,
+    ):
+        messages = [
+            SystemMessage(
+                content=MAIN_MODEL_SYSTEM_PROMPT
+            ),
+            HumanMessage(
+                content=state["original_query"]
+            ),
+        ]
+
+        response = self.main_model.invoke(
+            messages
+        )
+
+        return {
+            "original_answer":
+                response.content.strip(),
+
+            "original_answer_usage":
+                get_token_usage(response),
+        }
+
+    def answer_expanded_query(
+            self,
+            state: ClarificationState,
+    ):
+        expanded_query = state["expanded_query"]
+
+        if not expanded_query:
+            raise ValueError(
+                "No expanded query is available."
+            )
+
+        messages = [
+            SystemMessage(
+                content=MAIN_MODEL_SYSTEM_PROMPT
+            ),
+            HumanMessage(
+                content=expanded_query
+            ),
+        ]
+
+        response = self.main_model.invoke(
+            messages
+        )
+
+        return {
+            "expanded_answer":
+                response.content.strip(),
+
+            "expanded_answer_usage":
+                get_token_usage(response),
+        }
+
     def build(self):
         self.builder.add_node("generate_question", self.generate_question)
         self.builder.add_node("ask_user", self.ask_user)
         self.builder.add_node("synthesize_query", self.synthesize_query)
+        self.builder.add_node("answer_original_query", self.answer_original_query)
+        self.builder.add_node("answer_expanded_query",self.answer_expanded_query)
 
         self.builder.add_edge(START, "generate_question")
         self.builder.add_conditional_edges(
@@ -297,6 +402,16 @@ class ContextNetwork:
 
         self.builder.add_edge(
             "synthesize_query",
+            "answer_original_query",
+        )
+
+        self.builder.add_edge(
+            "answer_original_query",
+            "answer_expanded_query",
+        )
+
+        self.builder.add_edge(
+            "answer_expanded_query",
             END,
         )
 
@@ -323,6 +438,10 @@ def get_interrupt_payload(result: dict) -> dict | None:
 def get_token_usage(response) -> TokenUsage:
     usage = response.usage_metadata or {}
 
+    input_details = (
+        usage.get("input_token_details") or {}
+    )
+
     output_details = (
         usage.get("output_token_details") or {}
     )
@@ -335,10 +454,57 @@ def get_token_usage(response) -> TokenUsage:
             usage.get("output_tokens", 0),
 
         "reasoning_tokens":
-            output_details.get("reasoning", 0),
+            output_details.get("reasoning"),
 
         "total_tokens":
             usage.get("total_tokens", 0),
+
+        "cached_input_tokens":
+            input_details.get("cache_read"),
+    }
+
+def sum_optional(
+    values: list[int | None]
+) -> int | None:
+
+    reported = [
+        value
+        for value in values
+        if value is not None
+    ]
+
+    if not reported:
+        return None
+
+    return sum(reported)
+
+def add_usage(
+    *items: TokenUsage,
+) -> TokenUsage:
+    return {
+        "input_tokens": sum(
+            item["input_tokens"]
+            for item in items
+        ),
+        "output_tokens": sum(
+            item["output_tokens"]
+            for item in items
+        ),
+        "total_tokens": sum(
+            item["total_tokens"]
+            for item in items
+        ),
+        "cached_input_tokens":
+            sum_optional([
+                item["cached_input_tokens"]
+                for item in items
+            ]),
+
+        "reasoning_tokens":
+            sum_optional([
+                item["reasoning_tokens"]
+                for item in items
+            ]),
     }
 
 if __name__ == "__main__":
@@ -375,6 +541,11 @@ if __name__ == "__main__":
 
         "extractor_usage": empty_token_usage(),
         "synthesis_usage": empty_token_usage(),
+        "original_answer_usage": empty_token_usage(),
+        "expanded_answer_usage": empty_token_usage(),
+
+        "original_answer": None,
+        "expanded_answer": None,
     }
 
     # Start the graph.
@@ -472,63 +643,75 @@ if __name__ == "__main__":
     print("\nSynthesized query:")
     print(expanded_query)
 
-    extractor_usage = final_state["extractor_usage"]
-    synthesis_usage = final_state["synthesis_usage"]
-
-    print("\nToken usage")
-
-    print("\nExtractor:")
-    print(
-        f"  Input:     "
-        f"{extractor_usage['input_tokens']}"
-    )
-    print(
-        f"  Output:    "
-        f"{extractor_usage['output_tokens']}"
-    )
-    print(
-        f"  Reasoning: "
-        f"{extractor_usage['reasoning_tokens']}"
-    )
-    print(
-        f"  Total:     "
-        f"{extractor_usage['total_tokens']}"
+    baseline_usage = (
+        final_state["original_answer_usage"]
     )
 
-    print("\nSynthesis:")
-    print(
-        f"  Input:     "
-        f"{synthesis_usage['input_tokens']}"
-    )
-    print(
-        f"  Output:    "
-        f"{synthesis_usage['output_tokens']}"
-    )
-    print(
-        f"  Reasoning: "
-        f"{synthesis_usage['reasoning_tokens']}"
-    )
-    print(
-        f"  Total:     "
-        f"{synthesis_usage['total_tokens']}"
+    enhanced_remote_usage = (
+        final_state["expanded_answer_usage"]
     )
 
-    print("\nContextExtractor total:")
+    context_extractor_usage = add_usage(
+        final_state["extractor_usage"],
+        final_state["synthesis_usage"],
+    )
+
+    enhanced_total_usage = add_usage(
+        final_state["extractor_usage"],
+        final_state["synthesis_usage"],
+        final_state["expanded_answer_usage"],
+    )
+
+    print("\nOriginal query:")
+    print(final_state["original_query"])
+
+    print("\nOriginal answer:")
+    print(final_state["original_answer"])
+
+    print("\nSynthesized query:")
+    print(final_state["expanded_query"])
+
+    print("\nExpanded-query answer:")
+    print(final_state["expanded_answer"])
+
+    print("\n--- Token comparison ---")
 
     print(
-        "  Input:",
-        extractor_usage["input_tokens"]
-        + synthesis_usage["input_tokens"]
+        "\nBaseline main-model call:",
+        baseline_usage,
     )
 
     print(
-        "  Output:",
-        extractor_usage["output_tokens"]
-        + synthesis_usage["output_tokens"]
+        "\nContextExtractor only:",
+        context_extractor_usage,
     )
 
     print(
-        "  Total:",
-        extractor_usage["total_tokens"]
-        + synthesis_usage["total_tokens"]
+        "\nExpanded-query main-model call:",
+        enhanced_remote_usage,
+    )
+
+    print(
+        "\nComplete enhanced pipeline:",
+        enhanced_total_usage,
+    )
+
+    remote_token_delta = (
+            enhanced_remote_usage["total_tokens"]
+            - baseline_usage["total_tokens"]
+    )
+
+    pipeline_token_delta = (
+            enhanced_total_usage["total_tokens"]
+            - baseline_usage["total_tokens"]
+    )
+
+    print(
+        "\nRemote token delta:",
+        remote_token_delta,
+    )
+
+    print(
+        "Full pipeline token delta:",
+        pipeline_token_delta,
     )
