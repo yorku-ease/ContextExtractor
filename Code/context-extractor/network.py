@@ -20,7 +20,7 @@ You are an intermediate tool between a user and a larger conversation model.
 Your purpose is to analyze a user's prompt and try to derive additional context to help towards a more complete answer.
 Do not attempt to answer the original query itself.
 Do not make any assumptions about information the user has not provided.
-Strictly ask exactly one question at a time.
+Strictly ask exactly one question at a time. Do not add any "or" or "and" so that you can ask a second question.
 Do not ask for information the user has already provided.
 A maximum of {MAX_CLARIFICATIONS} clarification questions may eventually be asked,
 but you must only ask one question in the current response.
@@ -73,7 +73,7 @@ def empty_token_usage() -> TokenUsage:
         "cached_input_tokens": None,
     }
 
-class LocalModel:
+class ChatModel:
     model: BaseChatModel
 
     def __init__(self, model: BaseChatModel):
@@ -109,40 +109,56 @@ class ClarificationState(MessagesState):
     expanded_answer_usage: TokenUsage
 
 class ContextNetwork:
-    extractor_model: LocalModel
-    synthesis_model: LocalModel
+    extractor_model: ChatModel
+    synthesis_model: ChatModel
     builder: StateGraph
 
-    def __init__(self, extractor_model_name: str, extractor_temperature: float=0, synthesis_model_name: str=None, synthesis_temperature: float=0,
-                 main_model_provider: str="openai", main_model_name: str = "gpt-6.1-sol", main_model_temperature: float=0):
+    def __init__(self, extractor_model_provider: str = "ollama", extractor_model_name: str = "gemma4:e4b", extractor_temperature: float | None = None,
+                 synthesis_model_provider: str = "ollama", synthesis_model_name: str = "gemma4:e4b", synthesis_temperature: float| None = None,
+                 main_model_provider: str="openai", main_model_name: str = "gpt-6.1-sol", main_model_temperature: float| None = None):
 
-        extractor_base_model = ChatOllama(model=extractor_model_name, temperature=extractor_temperature)
-        self.extractor_model = LocalModel(extractor_base_model)
-        synthesis_base_model = ChatOllama(model=synthesis_model_name, temperature=synthesis_temperature)
-        self.synthesis_model = LocalModel(synthesis_base_model)
+        extractor_base_model = self.create_model(
+            provider=extractor_model_provider,
+            model_name=extractor_model_name,
+            temperature=extractor_temperature,
+        )
+        self.extractor_model = ChatModel(extractor_base_model)
+        synthesis_base_model = self.create_model(
+            provider=synthesis_model_provider,
+            model_name=synthesis_model_name,
+            temperature=synthesis_temperature,
+        )
+        self.synthesis_model = ChatModel(synthesis_base_model)
         self.builder = StateGraph(ClarificationState)
 
-        self.main_model = self.create_main_model(
+        self.main_model = self.create_model(
             provider=main_model_provider,
             model_name=main_model_name,
             temperature=main_model_temperature,
         )
 
-    def create_main_model(self,
-            provider: Literal["openai", "gemini"],
+    def create_model(
+            self,
+            provider: Literal["ollama", "openai", "gemini"],
             model_name: str,
-            temperature: float = 0,
+            temperature: float | None = None,
     ) -> BaseChatModel:
 
+        kwargs = {
+            "model": model_name,
+        }
+
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        if provider == "ollama":
+            return ChatOllama(**kwargs)
+
         if provider == "openai":
-            return ChatOpenAI(
-                model=model_name,
-            )
+            return ChatOpenAI(**kwargs)
 
         if provider == "gemini":
-            return ChatGoogleGenerativeAI(
-                model=model_name,
-            )
+            return ChatGoogleGenerativeAI(**kwargs)
 
         raise ValueError(
             f"Unsupported provider: {provider}"
@@ -508,7 +524,9 @@ def add_usage(
     }
 
 if __name__ == "__main__":
-    network = ContextNetwork(extractor_model_name="gemma4:e4b", extractor_temperature=0, synthesis_model_name="gemma4:e4b", synthesis_temperature=0)
+    network = ContextNetwork(extractor_model_provider="ollama", extractor_model_name="gemma4:e4b", extractor_temperature=0,
+                             synthesis_model_provider="ollama", synthesis_model_name="gemma4:e4b", synthesis_temperature=0,
+                             main_model_provider="openai", main_model_name="gpt-6.1-sol", main_model_temperature=None)
     graph = network.build()
 
     query = (
